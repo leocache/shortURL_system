@@ -3,6 +3,7 @@ package com.leo.shorturl.service.impl;
 import com.leo.shorturl.constants.RedisKeyConstants;
 import com.leo.shorturl.domain.dto.LongURL;
 import com.leo.shorturl.domain.po.UrlMapping;
+import com.leo.shorturl.event.UrlAccessEvent;
 import com.leo.shorturl.exception.ShortUrlNotFoundException;
 import com.leo.shorturl.mapper.UrlMappingMapper;
 import com.leo.shorturl.service.IUrlMappingService;
@@ -10,7 +11,9 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.leo.shorturl.utils.JsonUtils;
 import com.leo.shorturl.utils.ShortUrlUtils;
 import lombok.AllArgsConstructor;
+import lombok.RequiredArgsConstructor;
 import org.springframework.beans.BeanUtils;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.HttpStatus;
@@ -19,6 +22,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.servlet.view.RedirectView;
 
 import java.time.LocalDateTime;
+import java.util.concurrent.TimeUnit;
 
 /**
  * <p>
@@ -29,10 +33,12 @@ import java.time.LocalDateTime;
  * @since 2025-09-06
  */
 @Service
-@AllArgsConstructor
+@RequiredArgsConstructor
 public class UrlMappingServiceImpl extends ServiceImpl<UrlMappingMapper, UrlMapping> implements IUrlMappingService {
     private static final int MAX_RETRIES = 5; // 定义最大重试次数以防哈希碰撞
     private final StringRedisTemplate redisTemplate;
+    private final ApplicationEventPublisher eventPublisher;
+
     /**
      * 创建短链接
      * @param longURL 包含长链接和可选的过期时间
@@ -72,30 +78,32 @@ public class UrlMappingServiceImpl extends ServiceImpl<UrlMappingMapper, UrlMapp
         // 1.查询缓存
         String key= RedisKeyConstants.SHORT_URL_KEY_PREFIX + shortCode;
         String cachedData = redisTemplate.opsForValue().get(key);
+        UrlMapping map;
         // 1.1 如果缓存存在直接返回
         if (cachedData != null) {
-            UrlMapping cacheMap=JsonUtils.fromJson(cachedData, UrlMapping.class);
-            return getRedirectView(cacheMap.getLongUrl());
-        }
-        // 2. 缓存不存在查询数据库
-        UrlMapping map = lambdaQuery()
-                .eq(UrlMapping::getShortCode, shortCode)
-                .eq(UrlMapping::getIsEnabled,true)
-                .gt(UrlMapping::getExpiresAt, LocalDateTime.now())
-                .last("LIMIT 1")
-                .one();
-        // 2.1 如果不存在则返回404页面
-        if (map == null) {
-            throw new ShortUrlNotFoundException("Short URL not found for code: " + shortCode);
-        }
-        // 2.2 存在则写入缓存并返回
-        if (map.getExpiresAt() != null) {
-            // 计算过期时间
-            long seconds = java.time.Duration.between(LocalDateTime.now(), map.getExpiresAt()).getSeconds();
-            redisTemplate.opsForValue().set(key, JsonUtils.toJson(map), seconds);
+            map=JsonUtils.fromJson(cachedData, UrlMapping.class);
         }else {
-            redisTemplate.opsForValue().set(key,JsonUtils.toJson(map));
+            // 2. 缓存不存在查询数据库
+            map = lambdaQuery()
+                    .eq(UrlMapping::getShortCode, shortCode)
+                    .eq(UrlMapping::getIsEnabled,true)
+                    .gt(UrlMapping::getExpiresAt, LocalDateTime.now())
+                    .last("LIMIT 1")
+                    .one();
+            // 2.1 如果不存在则返回404页面
+            if (map == null) {
+                throw new ShortUrlNotFoundException("Short URL not found for code: " + shortCode);
+            }
+            // 2.2 存在则写入缓存并返回
+            if (map.getExpiresAt() != null) {
+                // 计算过期时间
+                long seconds = java.time.Duration.between(LocalDateTime.now(), map.getExpiresAt()).getSeconds();
+                redisTemplate.opsForValue().set(key, JsonUtils.toJson(map), seconds, TimeUnit.SECONDS);
+            }else {
+                redisTemplate.opsForValue().set(key,JsonUtils.toJson(map));
+            }
         }
+        eventPublisher.publishEvent(new UrlAccessEvent(shortCode));
         return getRedirectView(map.getLongUrl());
     }
 
